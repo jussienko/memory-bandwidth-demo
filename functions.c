@@ -112,6 +112,28 @@ void write_memory_avx(void* array, size_t size) {
   }
 }
 
+void memcpy_nontemporal_avx(void* array, void* array2, size_t size) {
+  __m256i* varray = (__m256i*) array;
+  __m256i* varray2 = (__m256i*) array2;
+
+  size_t i;
+  for (i = 0; i < size / sizeof(__m256); i++) {
+    __m256i vals =  _mm256_load_si256((__m256i*) &varray2[i]);
+    _mm256_stream_si256((__m256i*) &varray[i], vals);
+  }
+}
+
+void memcpy_avx(void* array, void* array2, size_t size) {
+  __m256i* varray = (__m256i*) array;
+  __m256i* varray2 = (__m256i*) array2;
+
+  size_t i;
+  for (i = 0; i < size / sizeof(__m256); i++) {
+    __m256i vals =  _mm256_load_si256((__m256i*) &varray2[i]);
+    _mm256_store_si256((__m256i*) &varray[i], vals);
+  }
+}
+
 void read_memory_prefetch_avx(void* array, size_t size) {
   __m256* varray = (__m256*) array;
   __m256 accum = _mm256_set1_ps((float) 0xDEADBEEF);
@@ -147,3 +169,82 @@ void read_memory_avx(void* array, size_t size) {
   assert(!_mm256_testz_ps(accum, accum));
 }
 #endif  // __AVX__
+
+#ifdef __AVX512__
+void write_memory_nontemporal_avx512(void* array, size_t size) {
+  __m512i* varray = (__m512i*) array;
+
+  __m512i vals = _mm512_set1_epi32(0xDEADBEEF);
+  size_t i;
+  for (i = 0; i < size / sizeof(__m512); i++) {
+    _mm256_stream_si512((__m512i*) &varray[i], vals);
+  }
+}
+
+void write_memory_avx512(void* array, size_t size) {
+  __m512i* varray = (__m512i*) array;
+
+  __m512i vals = _mm512_set1_epi32(0xDEADBEEF);
+  size_t i;
+  for (i = 0; i < size / sizeof(__m512i); i++) {
+    _mm512_store_si512(&varray[i], vals);
+  }
+}
+
+void memcpy_nontemporal_avx512(void* array, void* array2, size_t size) {
+  __m512i* varray = (__m512i*) array;
+  __m512i* varray2 = (__m512i*) array2;
+
+  size_t i;
+  for (i = 0; i < size / sizeof(__m512); i++) {
+    __m512i vals =  _mm256_load_si512((__m512i*) &varray2[i]);
+    _mm512_stream_si512((__m512i*) &varray[i], vals);
+  }
+}
+
+void memcpy_avx512(void* array, void* array2, size_t size) {
+  __m512i* varray = (__m512i*) array;
+  __m512i* varray2 = (__m512i*) array2;
+
+  size_t i;
+  for (i = 0; i < size / sizeof(__m512); i++) {
+    __m512i vals =  _mm256_load_si512((__m512i*) &varray2[i]);
+    _mm512_store_si512((__m512i*) &varray[i], vals);
+  }
+}
+
+void read_memory_prefetch_avx512(void* array, size_t size) {
+  __m512* varray = (__m512*) array;
+  __m512 accum = _mm512_set1_ps((float) 0xDEADBEEF);
+  size_t i;
+  for (i = 0; i < size / sizeof(__m512i); i++) {
+    // http://msdn.microsoft.com/en-us/library/cyxt4d09(v=vs.71).aspx
+    // http://goo.gl/P6wI4
+    // https://lwn.net/Articles/444336/
+    //
+    // We use PREFETCHNTA as instructed by the Intel Optimization Manual for
+    // when the algorithm is single pass (Page 7-2 of http://goo.gl/M3Vaq).
+    // Really though, since we access the data linearly, the hardware
+    // prefetcher ought to be good enough.
+    _mm_prefetch(&varray[i+2], _MM_HINT_NTA);
+    accum = _mm512_add_ps(varray[i], accum);
+  }
+
+  // This is unlikely, and we want to make sure the reads are not optimized
+  // away.
+  assert(!_mm512_testz_ps(accum, accum));
+}
+
+void read_memory_avx512(void* array, size_t size) {
+  __m512* varray = (__m512*) array;
+  __m512 accum = _mm512_set1_ps((float) 0xDEADBEEF);
+  size_t i;
+  for (i = 0; i < size / sizeof(__m512i); i++) {
+    accum = _mm512_add_ps(varray[i], accum);
+  }
+
+  // This is unlikely, and we want to make sure the reads are not optimized
+  // away.
+  assert(!_mm512_testz_ps(accum, accum));
+}
+#endif  // __AVX512__

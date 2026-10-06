@@ -8,9 +8,7 @@
 
 #include <assert.h>
 #include <math.h>
-#ifdef WITH_OPENMP
 #include <omp.h>
-#endif  // WITH_OPENMP
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -18,51 +16,45 @@
 #include <unistd.h>
 
 #include "./functions.h"
-#include "./monotonic_timer.h"
 
 #define SAMPLES 5
 #define TIMES 5
-#define BYTES_PER_GB (1024*1024*1024LL)
-#define SIZE (1*BYTES_PER_GB)
+#define BYTES_PER_GiB (1024*1024*1024LL)
+#define BYTES_PER_GB (1000*1000*1000LL)
+#define SIZE (1*BYTES_PER_GiB)
 #define PAGE_SIZE (1<<12)
 
-// This must be at least 32 byte aligned to make some AVX instructions happy.
-// Have PAGE_SIZE buffering so we don't have to do math for prefetching.
-char array[SIZE + PAGE_SIZE] __attribute__((aligned (32)));
 
-// Compute the bandwidth in GiB/s.
+// Compute the bandwidth in GB/s.
 static inline double to_bw(size_t bytes, double secs) {
   double size_bytes = (double) bytes;
   double size_gb = size_bytes / ((double) BYTES_PER_GB);
   return size_gb / secs;
 }
 
-#ifdef WITH_OPENMP
 // Time a function, printing out time to perform the memory operation and
 // the computed memory bandwidth. Use openmp to do threading (set environment
 // variable OMP_NUM_THREADS to control threads use.
-#define timefunp(f) timeitp(f, #f)
-void timeitp(void (*function)(void*, size_t), char* name) {
+#define timefun(f, array) timeitp(f, array, #f)
+void timeitp(void (*function)(void*, size_t), char* array, char* name) {
   double min = INFINITY;
   size_t i;
   for (i = 0; i < SAMPLES; i++) {
     double before, after, total;
 
-    assert(SIZE % omp_get_max_threads() == 0);
-
-    size_t chunk_size = SIZE / omp_get_max_threads();
+    size_t chunk_size = SIZE;
 #pragma omp parallel
     {
 #pragma omp barrier
 #pragma omp master
-      before = monotonic_time();
+      before = omp_get_wtime();
       int j;
       for (j = 0; j < TIMES; j++) {
 	function(&array[chunk_size * omp_get_thread_num()], chunk_size);
       }
 #pragma omp barrier
 #pragma omp master
-      after = monotonic_time();
+      after = omp_get_wtime();
     }
 
     total = after - before;
@@ -71,25 +63,32 @@ void timeitp(void (*function)(void*, size_t), char* name) {
     }
   }
 
-  printf("%28s_omp: %5.2f GiB/s\n", name, to_bw(SIZE * TIMES, min));
+  printf("%28s: %5.2f GB/s\n", name, to_bw(omp_get_max_threads() * SIZE * TIMES, min));
 }
-#endif  // WITH_OPENMP
 
-// Time a function, printing out time to perform the memory operation and
-// the computed memory bandwidth.
-#define timefun(f) timeit(f, #f)
-void timeit(void (*function)(void*, size_t), char* name) {
+#define timefun2(f, array, array2) timeitp2(f, array, array2, #f)
+void timeitp2(void (*function)(void*, void*, size_t), char* array,
+              char* array2, char* name) {
   double min = INFINITY;
   size_t i;
   for (i = 0; i < SAMPLES; i++) {
     double before, after, total;
 
-    before = monotonic_time();
-    int j;
-    for (j = 0; j < TIMES; j++) {
-      function(array, SIZE);
+    size_t chunk_size = SIZE;
+#pragma omp parallel
+    {
+#pragma omp barrier
+#pragma omp master
+      before = omp_get_wtime();
+      int j;
+      for (j = 0; j < TIMES; j++) {
+	function(&array[chunk_size * omp_get_thread_num()], 
+                 &array2[chunk_size * omp_get_thread_num()], chunk_size);
+      }
+#pragma omp barrier
+#pragma omp master
+      after = omp_get_wtime();
     }
-    after = monotonic_time();
 
     total = after - before;
     if (total < min) {
@@ -97,65 +96,55 @@ void timeit(void (*function)(void*, size_t), char* name) {
     }
   }
 
-  printf("%32s: %5.2f GiB/s\n", name, to_bw(SIZE * TIMES, min));
+  printf("%28s: %5.2f GB/s\n", name, to_bw(omp_get_max_threads() * SIZE * TIMES, min));
 }
 
 int main() {
-  memset(array, 0xFF, SIZE);  // un-ZFOD the page.
-  * ((uint64_t *) &array[SIZE]) = 0;
 
-  // TODO(awreece) iopl(0) and cli/sti?
+  char *array, *array2;
+  
+  int nthreads = omp_get_max_threads();
+  printf("# Running with %d threads\n", nthreads);
+  double size_bytes = (double) SIZE;
+  double size_gb = size_bytes / ((double) BYTES_PER_GB);
 
-  timefun(read_memory_rep_lodsq);
-  timefun(read_memory_loop);
+  printf("# Array size per thread %5.3f GB\n", size_gb);
+  
+  // Arrays must be at least 64 byte aligned for AVX512.
+  // Have PAGE_SIZE buffering so we don't have to do math for prefetching.
+  posix_memalign((void *) &array, 64, omp_get_max_threads() * SIZE + PAGE_SIZE);
+  posix_memalign((void *) &array2, 64, omp_get_max_threads() * SIZE + PAGE_SIZE);
+
+  size_t chunk_size = SIZE;
+// First touch
+#pragma omp parallel
+    {
+       memset(&array[chunk_size * omp_get_thread_num()], 0xFF, chunk_size); 
+       memset(&array2[chunk_size * omp_get_thread_num()], 0xFE, chunk_size); 
+    }
+
+  timefun(read_memory_rep_lodsq, array);
+  timefun(read_memory_loop, array);
 #ifdef __SSE4_1__
-  timefun(read_memory_sse);
+  timefun(read_memory_sse, array);
 #endif
 #ifdef __AVX__
-  timefun(read_memory_avx);
-  timefun(read_memory_prefetch_avx);
+  timefun(read_memory_avx, array);
+  timefun(read_memory_prefetch_avx, array);
 #endif
 
-  timefun(write_memory_loop);
-  timefun(write_memory_rep_stosq);
+  timefun(write_memory_rep_stosq, array);  
+  timefun(write_memory_loop, array);
 #ifdef __SSE4_1__
-  timefun(write_memory_sse);
-  timefun(write_memory_nontemporal_sse);
+  timefun(write_memory_sse, array);
+  timefun(write_memory_nontemporal_sse, array);
 #endif
 #ifdef __AVX__
-  timefun(write_memory_avx);
-  timefun(write_memory_nontemporal_avx);
+  timefun(write_memory_avx, array);
+  timefun(write_memory_nontemporal_avx, array);
+  timefun2(memcpy_avx, array, array2);
+  timefun2(memcpy_nontemporal_avx, array, array2);
 #endif
-  timefun(write_memory_memset);
-
-#ifdef WITH_OPENMP
-
-  memset(array, 0xFF, SIZE);  // un-ZFOD the page.
-  * ((uint64_t *) &array[SIZE]) = 0;
-
-  timefunp(read_memory_rep_lodsq);
-  timefunp(read_memory_loop);
-#ifdef __SSE4_1__
-  timefunp(read_memory_sse);
-#endif
-#ifdef __AVX__
-  timefunp(read_memory_avx);
-  timefunp(read_memory_prefetch_avx);
-#endif
-
-  timefunp(write_memory_loop);
-  timefunp(write_memory_rep_stosq);
-#ifdef __SSE4_1__
-  timefunp(write_memory_sse);
-  timefunp(write_memory_nontemporal_sse);
-#endif
-#ifdef __AVX__
-  timefunp(write_memory_avx);
-  timefunp(write_memory_nontemporal_avx);
-#endif
-  timefunp(write_memory_memset);
-
-#endif  // WITH_OPENMP
-
+  timefun(write_memory_memset, array);
   return 0;
 }
